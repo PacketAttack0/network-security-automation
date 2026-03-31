@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
 import os
 import logging
 import requests
 from illumio import PolicyComputeEngine, IPList, IPRange
+
 
 # ----------------------------
 # Config (via environment vars)
@@ -23,8 +23,12 @@ TARGET_IPLIST_NAME = os.getenv(
     "MEDIGATE-Medical-Critical"
 )
 
+# Auto-provision toggle
+AUTO_PROVISION = os.getenv("AUTO_PROVISION", "true").lower() == "true"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medigate_illumio_sync")
+
 
 # ---------------
 # Medigate client
@@ -35,6 +39,7 @@ def medigate_headers():
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+
 
 def fetch_medigate_devices():
     """
@@ -72,7 +77,6 @@ def fetch_medigate_devices():
             },
             "offset": offset,
             "limit": MEDIGATE_PAGE_SIZE,
-            # Include fields you care about; ip_list is key here. [web:42][web:59]
             "fields": ["ip_list", "device_type", "device_category", "uid"],
             "include_count": False,
         }
@@ -82,7 +86,6 @@ def fetch_medigate_devices():
         resp.raise_for_status()
         data = resp.json()
 
-        # Your tenant returns: {"devices": [ ... ]} [web:42]
         batch = data.get("devices", [])
         if not batch:
             break
@@ -97,19 +100,20 @@ def fetch_medigate_devices():
     logger.info("Finished Medigate fetch: total devices %d", len(devices))
     return devices
 
+
 def clean_ip(ip_str: str) -> str:
     """
     Strip annotation like ' (Last known IP)' from IP strings,
-    keeping only the IP portion. [web:59]
+    keeping only the IP portion.
     """
     if not ip_str:
         return ""
-    # Split on space and take first token; covers "10.0.0.1 (Last known IP)"
     return ip_str.split()[0].strip()
+
 
 def extract_ips(devices):
     """
-    Build a set of cleaned IPs from devices[].ip_list. [web:42][web:59]
+    Build a set of cleaned IPs from devices[].ip_list.
     """
     ips = set()
     for d in devices:
@@ -120,6 +124,7 @@ def extract_ips(devices):
                 ips.add(ip)
     return ips
 
+
 # -------------
 # Illumio client
 # -------------
@@ -128,25 +133,52 @@ def illumio_client():
     pce.set_credentials(PCE_API_KEY, PCE_API_SECRET)
     return pce
 
+
 def get_iplist_by_name(pce, name):
     ip_lists = pce.ip_lists.get(params={"name": name})
     return ip_lists[0] if ip_lists else None
 
+
 def ensure_iplist(pce, name, ip_set):
     """
-    Create or replace an IP List with the given set of IPs. [web:11][web:16]
+    Create or replace an IP List with the given set of IPs.
     """
     ip_ranges = [IPRange(from_ip=ip) for ip in sorted(ip_set)]
 
     existing = get_iplist_by_name(pce, name)
     if existing:
-        logger.info("Updating IP List '%s' (%s) with %d IPs", name, existing.href, len(ip_set))
-        existing.ip_ranges = ip_ranges
-        pce.ip_lists.update(existing)
+        logger.info(
+            "Updating IP List '%s' (%s) with %d IPs",
+            name,
+            existing.href,
+            len(ip_set),
+        )
+        update_body = {
+            "ip_ranges": [{"from_ip": ip} for ip in sorted(ip_set)]
+        }
+        pce.ip_lists.update(existing.href, update_body)
     else:
         logger.info("Creating IP List '%s' with %d IPs", name, len(ip_set))
         new_list = IPList(name=name, ip_ranges=ip_ranges)
         pce.ip_lists.create(new_list)
+
+
+def auto_provision(pce):
+    """
+    Automatically provision draft changes in Illumio.
+    """
+    logger.info("Requesting Illumio policy provision")
+
+    payload = {
+        "update_description": f"Automated Medigate sync for IP List '{TARGET_IPLIST_NAME}'"
+    }
+
+    # illumio-py does not expose every workflow cleanly across versions,
+    # so use the underlying API call directly.
+    response = pce.post("/sec_policy", json=payload)
+
+    logger.info("Provision request submitted: %s", response)
+
 
 # ------------
 # Main workflow
@@ -164,10 +196,19 @@ def sync_medigate_to_illumio():
 
     logger.info("Extracted %d unique IPs from Medigate", len(ip_set))
 
+    if not ip_set:
+        raise RuntimeError("No IPs were extracted from Medigate; refusing to update Illumio with an empty set")
+
     pce = illumio_client()
     ensure_iplist(pce, TARGET_IPLIST_NAME, ip_set)
 
+    if AUTO_PROVISION:
+        auto_provision(pce)
+    else:
+        logger.info("AUTO_PROVISION is disabled; skipping Illumio provision step")
+
     logger.info("Sync complete for IP List '%s'", TARGET_IPLIST_NAME)
+
 
 if __name__ == "__main__":
     sync_medigate_to_illumio()
