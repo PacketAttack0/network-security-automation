@@ -1,0 +1,4 @@
+#AWS
+*.aws.amazon.com
+*.amazonaws.com
+*.awsstatic.com
